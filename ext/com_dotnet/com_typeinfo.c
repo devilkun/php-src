@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Author: Wez Furlong <wez@thebrainroom.com>                           |
    |         Harald Radi <h.radi@nme.at>                                  |
@@ -16,12 +14,10 @@
  */
 
 #ifdef HAVE_CONFIG_H
-#include "config.h"
+#include <config.h>
 #endif
 
 #include "php.h"
-#include "php_ini.h"
-#include "ext/standard/info.h"
 #include "php_com_dotnet.h"
 #include "php_com_dotnet_internal.h"
 
@@ -215,7 +211,7 @@ PHP_COM_DOTNET_API zend_result php_com_import_typelib(ITypeLib *TL, int mode, in
 				php_com_zval_from_variant(&value, pVarDesc->lpvarValue, codepage);
 				if ((exists = zend_get_constant(const_name)) != NULL) {
 					if (COMG(autoreg_verbose) && !compare_function(&results, &value, exists)) {
-						php_error_docref(NULL, E_WARNING, "Type library constant %s is already defined", ZSTR_VAL(const_name));
+						php_error_docref(NULL, E_WARNING, "Type library constant %pS is already defined", const_name);
 					}
 					zend_string_release_ex(const_name, /* persistent */ false);
 					ITypeInfo_ReleaseVarDesc(TypeInfo, pVarDesc);
@@ -302,6 +298,39 @@ php_com_load_typelib_via_cache_return:
 	return TL;
 }
 
+static ITypeInfo *php_com_find_impl_typeinfo(ITypeInfo *coinfo, const GUID *iid)
+{
+	ITypeInfo *found = NULL;
+	TYPEATTR *coattr;
+
+	if (FAILED(ITypeInfo_GetTypeAttr(coinfo, &coattr))) {
+		return NULL;
+	}
+
+	for (unsigned int i = 0; i < coattr->cImplTypes && !found; i++) {
+		HREFTYPE rt;
+		ITypeInfo *implinfo;
+		TYPEATTR *implattr;
+
+		if (FAILED(ITypeInfo_GetRefTypeOfImplType(coinfo, i, &rt)) ||
+				FAILED(ITypeInfo_GetRefTypeInfo(coinfo, rt, &implinfo))) {
+			continue;
+		}
+		if (SUCCEEDED(ITypeInfo_GetTypeAttr(implinfo, &implattr))) {
+			if (IsEqualGUID(&implattr->guid, iid)) {
+				found = implinfo;
+			}
+			ITypeInfo_ReleaseTypeAttr(implinfo, implattr);
+		}
+		if (!found) {
+			ITypeInfo_Release(implinfo);
+		}
+	}
+
+	ITypeInfo_ReleaseTypeAttr(coinfo, coattr);
+	return found;
+}
+
 ITypeInfo *php_com_locate_typeinfo(zend_string *type_lib_name, php_com_dotnet_object *obj,
 	zend_string *dispatch_name, bool sink)
 {
@@ -318,6 +347,14 @@ ITypeInfo *php_com_locate_typeinfo(zend_string *type_lib_name, php_com_dotnet_ob
 
 				if (SUCCEEDED(IDispatch_QueryInterface(V_DISPATCH(&obj->v), &IID_IProvideClassInfo2, (void**)&pci2))) {
 					gotguid = SUCCEEDED(IProvideClassInfo2_GetGUID(pci2, GUIDKIND_DEFAULT_SOURCE_DISP_IID, &iid));
+					if (gotguid) {
+						ITypeInfo *coinfo;
+
+						if (SUCCEEDED(IProvideClassInfo2_GetClassInfo(pci2, &coinfo))) {
+							typeinfo = php_com_find_impl_typeinfo(coinfo, &iid);
+							ITypeInfo_Release(coinfo);
+						}
+					}
 					IProvideClassInfo2_Release(pci2);
 				}
 				if (!gotguid && SUCCEEDED(IDispatch_QueryInterface(V_DISPATCH(&obj->v), &IID_IProvideClassInfo, (void**)&pci))) {
@@ -331,7 +368,7 @@ ITypeInfo *php_com_locate_typeinfo(zend_string *type_lib_name, php_com_dotnet_ob
 			if (obj->typeinfo) {
 				ITypeInfo_AddRef(obj->typeinfo);
 				return obj->typeinfo;
-			} else {
+			} else if (V_VT(&obj->v) == VT_DISPATCH) {
 				IDispatch_GetTypeInfo(V_DISPATCH(&obj->v), 0, LANG_NEUTRAL, &typeinfo);
 				if (typeinfo) {
 					return typeinfo;
@@ -408,8 +445,6 @@ ITypeInfo *php_com_locate_typeinfo(zend_string *type_lib_name, php_com_dotnet_ob
 
 
 		efree(olename);
-	} else if (gotguid) {
-		ITypeLib_GetTypeInfoOfGuid(typelib, &iid, &typeinfo);
 	}
 
 	if (typelib) {
@@ -504,7 +539,7 @@ bool php_com_process_typeinfo(ITypeInfo *typeinfo, HashTable *id_to_name, bool p
 			SysFreeString(olename);
 
 			guid_str = php_com_string_from_clsid(&attr->guid, codepage);
-			php_printf("class %s { /* GUID=%s */\n", ZSTR_VAL(ansi_name), ZSTR_VAL(guid_str));
+			php_printf("class %pS { /* GUID=%pS */\n", ansi_name, guid_str);
 			zend_string_release_ex(guid_str, /* persistent */ false);
 			zend_string_release_ex(ansi_name, /* persistent */ false);
 		}
@@ -543,7 +578,7 @@ bool php_com_process_typeinfo(ITypeInfo *typeinfo, HashTable *id_to_name, bool p
 					/* first element is the function name */
 					SysFreeString(names[0]);
 
-					php_printf("\t/* DISPID=%d */\n", func->memid);
+					php_printf("\t/* DISPID=%ld */\n", func->memid);
 
 					if (func->elemdescFunc.tdesc.vt != VT_VOID) {
 						php_printf("\t/* %s [%d] */\n",
@@ -558,16 +593,16 @@ bool php_com_process_typeinfo(ITypeInfo *typeinfo, HashTable *id_to_name, bool p
 						if (olename) {
 							func_desc = php_com_olestring_to_string(olename, codepage);
 							SysFreeString(olename);
-							php_printf("\t/* %s */\n", ZSTR_VAL(func_desc));
+							php_printf("\t/* %pS */\n", func_desc);
 							zend_string_release_ex(func_desc, /* persistent */ false);
 						}
 
-						php_printf("\tvar $%s;\n\n", ZSTR_VAL(ansi_name));
+						php_printf("\tvar $%pS;\n\n", ansi_name);
 
 					} else {
 						/* a function */
 
-						php_printf("\tfunction %s(\n", ZSTR_VAL(ansi_name));
+						php_printf("\tfunction %pS(\n", ansi_name);
 
 						for (j = 0; j < func->cParams; j++) {
 							ELEMDESC *elem = &func->lprgelemdescParam[j];
@@ -591,9 +626,9 @@ bool php_com_process_typeinfo(ITypeInfo *typeinfo, HashTable *id_to_name, bool p
 							if (j+1 < (int)cnames) {
 								func_desc = php_com_olestring_to_string(names[j+1], codepage);
 								SysFreeString(names[j+1]);
-								php_printf(" */ %s%s%c\n",
+								php_printf(" */ %s%pS%c\n",
 									elem->tdesc.vt == VT_PTR ? "&$" : "$",
-									ZSTR_VAL(func_desc),
+									func_desc,
 									j == func->cParams - 1 ? ' ' : ','
 								);
 							} else {
@@ -614,7 +649,7 @@ bool php_com_process_typeinfo(ITypeInfo *typeinfo, HashTable *id_to_name, bool p
 						if (olename) {
 							func_desc = php_com_olestring_to_string(olename, codepage);
 							SysFreeString(olename);
-							php_printf("\t\t/* %s */\n", ZSTR_VAL(func_desc));
+							php_printf("\t\t/* %pS */\n", func_desc);
 							zend_string_release_ex(func_desc, /* persistent */ false);
 						}
 
@@ -639,6 +674,8 @@ bool php_com_process_typeinfo(ITypeInfo *typeinfo, HashTable *id_to_name, bool p
 		}
 	} else {
 		zend_throw_error(NULL, "Type kind must be dispatchable, %08x given", attr->typekind);
+		ITypeInfo_ReleaseTypeAttr(typeinfo, attr);
+		return false;
 	}
 
 	ITypeInfo_ReleaseTypeAttr(typeinfo, attr);
